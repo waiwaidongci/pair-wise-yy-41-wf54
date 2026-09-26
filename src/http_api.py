@@ -98,6 +98,11 @@ def make_handler(service: Service, static_dir: str):
                     actor, role = self._identity()
                     del actor
                     self._json(200, {"events": service.audit(role)})
+                elif path == "/api/notices":
+                    actor, role = self._identity()
+                    del actor
+                    measure = parse_qs(urlparse(self.path).query).get("measure", [None])[0]
+                    self._json(200, {"notices": service.list_notices(role, measure)})
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:
@@ -110,6 +115,8 @@ def make_handler(service: Service, static_dir: str):
                 body = self._body()
                 if path == "/api/items":
                     self._json(201, service.create_item(body, actor, role))
+                elif path == "/api/notices":
+                    self._json(201, service.create_notice(body, actor, role))
                 elif path.startswith("/api/items/") and path.endswith("/records"):
                     item_id = int(path.split("/")[3])
                     self._json(201, service.add_record(item_id, body, actor, role))

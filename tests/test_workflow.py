@@ -3,14 +3,18 @@ from pathlib import Path
 from src.repository import Repository
 from src.service import Service
 from src.rules import STATES, TRANSITION_ROLES
+NOTICE_MEASURES={'restricted','closed','restored'}
 class WorkflowTest(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory(); self.repo=Repository(str(Path(self.tmp.name)/"test.db")); self.service=Service(self.repo)
     def tearDown(self): self.repo.close(); self.tmp.cleanup()
+    def _notice(self,measure,no):
+        return self.service.create_notice({"notice_no":no,"issuer":"市交通委","measure":measure,"effective_from":"2020-01-01T00:00:00+00:00"},"officer",'traffic_authority')
     def test_complete_workflow_and_audit(self):
         item=self.service.create_item({"title":"workflow item","description":"complete business flow","severity":'warning',"quantity":12,"threshold":6,"external_ref":"WF-1"},"creator",'sensor_operator')
         self.assertEqual(item["status"],STATES[0])
         self.service.add_record(item["id"],{"kind":"evidence","detail":"evidence registered","status":"closed","external_ref":"EV-1"},"recorder",'sensor_operator')
+        for i,measure in enumerate(sorted(NOTICE_MEASURES),1): self._notice(measure,f"NT-{i}")
         current=item
         for target in STATES[1:]:
             current=self.service.transition(current["id"],target,current["version"],"reviewer",TRANSITION_ROLES[target][0])

@@ -15,6 +15,8 @@ class FailureTest(unittest.TestCase):
         payload={"kind":"action","detail":"same reference","status":"open","external_ref":"DUP-1"}
         self.service.add_record(self.item["id"],payload,"recorder",'sensor_operator')
         with self.assertRaises(ConflictError): self.service.add_record(self.item["id"],payload,"recorder",'sensor_operator')
+        for i,measure in enumerate(('restricted','closed','restored'),1):
+            self.service.create_notice({"notice_no":f"FN-{i}","issuer":"市交通委","measure":measure,"effective_from":"2020-01-01T00:00:00+00:00"},"officer",'traffic_authority')
         current=self.service.get_item(self.item["id"],"viewer")
         for target in STATES[1:-1]: current=self.service.transition(current["id"],target,current["version"],"reviewer",TRANSITION_ROLES[target][0])
         with self.assertRaises(ConflictError): self.service.transition(current["id"],STATES[-1],current["version"],"reviewer",TRANSITION_ROLES[STATES[-1]][0])

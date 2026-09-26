@@ -21,6 +21,7 @@ class Repository:
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.execute("PRAGMA journal_mode = WAL")
         self._create_schema()
+        self._migrate()
 
     def _create_schema(self) -> None:
         statuses = ",".join("'" + s.replace("'", "''") + "'" for s in STATES)
@@ -66,6 +67,27 @@ class Repository:
                     created_at TEXT NOT NULL
                 );
             """)
+
+    def _migrate(self) -> None:
+        """按user_version递增升级，旧库启动后自动补齐新结构。"""
+        with self.conn:
+            version = int(self.conn.execute("PRAGMA user_version").fetchone()[0])
+            if version < 1:
+                self.conn.executescript("""
+                    CREATE TABLE IF NOT EXISTS notices (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        notice_no TEXT NOT NULL UNIQUE,
+                        issuer TEXT NOT NULL,
+                        measure TEXT NOT NULL
+                            CHECK(measure IN ('restricted','closed','restored')),
+                        effective_from TEXT NOT NULL,
+                        effective_to TEXT,
+                        lifted_at TEXT,
+                        created_by TEXT NOT NULL,
+                        created_at TEXT NOT NULL
+                    );
+                """)
+                self.conn.execute("PRAGMA user_version=1")
 
     @staticmethod
     def _item(row: sqlite3.Row) -> Dict[str, Any]:
@@ -156,6 +178,38 @@ class Repository:
                 (item_id,),
             ).fetchone()
         return int(row["n"])
+
+    def create_notice(self, notice_no: str, issuer: str, measure: str,
+                      effective_from: str, effective_to: Optional[str],
+                      lifted_at: Optional[str], actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        try:
+            with self._lock, self.conn:
+                cur = self.conn.execute(
+                    """INSERT INTO notices(notice_no, issuer, measure, effective_from,
+                       effective_to, lifted_at, created_by, created_at)
+                       VALUES(?,?,?,?,?,?,?,?)""",
+                    (notice_no, issuer, measure, effective_from, effective_to,
+                     lifted_at, actor, now),
+                )
+                notice_id = int(cur.lastrowid)
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("通告编号已存在") from exc
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM notices WHERE id=?", (notice_id,)).fetchone()
+        return dict(row)
+
+    def list_notices(self, measure: Optional[str] = None) -> List[Dict[str, Any]]:
+        sql = "SELECT * FROM notices"
+        params: tuple = ()
+        if measure:
+            sql += " WHERE measure=?"
+            params = (measure,)
+        sql += " ORDER BY id DESC"
+        with self._lock:
+            rows = self.conn.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
 
     def append_audit(self, action: str, entity_type: str, entity_id: int,
                      actor: str, detail: dict) -> Dict[str, Any]:
