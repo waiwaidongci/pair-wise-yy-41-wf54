@@ -2,11 +2,16 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from .domain import ensure_role, normalize_severity, require_number, require_text
+from .audit import utc_now
+from .domain import (ConflictError, ValidationError, ensure_role,
+                     normalize_measure, normalize_severity, require_number,
+                     require_text, require_timestamp)
 from .repository import Repository
-from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY, RECORD_ROLES, TITLE,
-                    VIEW_ROLES, completion_blockers, escalation_required,
-                    priority_score, response_deadline_hours, role_for_transition,
+from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY, NOTICE_ENTITY,
+                    NOTICE_ROLES, RECORD_ROLES, TITLE, VIEW_ROLES,
+                    completion_blockers, escalation_required, notice_blockers,
+                    notice_effective, priority_score, required_notice_measure,
+                    response_deadline_hours, role_for_transition,
                     validate_transition)
 
 
@@ -64,16 +69,53 @@ class Service:
         if not isinstance(expected_version, int) or expected_version < 1:
             raise ValueError("expected_version必须是正整数")
         blockers = completion_blockers(target, self.repository.open_record_count(item_id))
+        measure = required_notice_measure(target)
+        notice = self.repository.latest_notice(measure) if measure else None
+        blockers += notice_blockers(target, notice, utc_now())
         if blockers:
-            from .domain import ConflictError
             raise ConflictError("；".join(blockers))
         updated = self.repository.transition_item(item_id, target, expected_version, actor)
         self.repository.append_audit("transition", ENTITY, item_id, actor, {
             "from": item["status"], "to": target,
+            "notice_no": notice["notice_no"] if notice else None,
             "escalation_required": escalation_required(
                 item["severity"], item["quantity"], item["threshold"]),
         })
         return self.enrich(updated)
+
+    def create_notice(self, payload: Dict[str, Any], actor: str, role: str) -> Dict[str, Any]:
+        ensure_role(role, NOTICE_ROLES)
+        actor = require_text(actor, "actor", 100)
+        notice_no = require_text(payload.get("notice_no"), "notice_no", 100)
+        issuer = require_text(payload.get("issuer"), "issuer", 200)
+        measure = normalize_measure(payload.get("measure"))
+        effective_from = require_timestamp(payload.get("effective_from"), "effective_from")
+        effective_to = require_timestamp(payload.get("effective_to"), "effective_to")
+        if effective_from >= effective_to:
+            raise ValidationError("effective_to必须晚于effective_from")
+        notice = self.repository.create_notice(notice_no, issuer, measure,
+                                               effective_from, effective_to, actor)
+        self.repository.append_audit("notice_create", NOTICE_ENTITY, notice["id"], actor, {
+            "notice_no": notice_no, "issuer": issuer, "measure": measure,
+            "effective_from": effective_from, "effective_to": effective_to,
+        })
+        return self.enrich_notice(notice)
+
+    def lift_notice(self, notice_id: int, actor: str, role: str) -> Dict[str, Any]:
+        ensure_role(role, NOTICE_ROLES)
+        actor = require_text(actor, "actor", 100)
+        notice = self.repository.lift_notice(notice_id, actor)
+        self.repository.append_audit("notice_lift", NOTICE_ENTITY, notice_id, actor, {
+            "notice_no": notice["notice_no"], "lifted_at": notice["lifted_at"],
+        })
+        return self.enrich_notice(notice)
+
+    def list_notices(self, role: str, measure: Optional[str] = None) -> list:
+        self._view(role)
+        if measure is not None:
+            measure = normalize_measure(measure)
+        return [self.enrich_notice(notice)
+                for notice in self.repository.list_notices(measure)]
 
     def get_item(self, item_id: int, role: str) -> Dict[str, Any]:
         self._view(role)
@@ -100,4 +142,10 @@ class Service:
             item["severity"], item["quantity"], item["threshold"])
         result["escalation_required"] = escalation_required(
             item["severity"], item["quantity"], item["threshold"])
+        return result
+
+    @staticmethod
+    def enrich_notice(notice: Dict[str, Any]) -> Dict[str, Any]:
+        result = dict(notice)
+        result["effective"] = notice_effective(notice, utc_now())
         return result

@@ -7,8 +7,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .audit import make_entry, utc_now
-from .domain import ConflictError, NotFoundError
+from .domain import NOTICE_MEASURES, ConflictError, NotFoundError
 from .rules import ID_PREFIX, STATES
+
+SCHEMA_VERSION = 2
 
 
 class Repository:
@@ -23,49 +25,74 @@ class Repository:
         self._create_schema()
 
     def _create_schema(self) -> None:
-        statuses = ",".join("'" + s.replace("'", "''") + "'" for s in STATES)
+        version = int(self.conn.execute("PRAGMA user_version").fetchone()[0])
         with self.conn:
-            self.conn.executescript(f"""
-                CREATE TABLE IF NOT EXISTS items (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    title TEXT NOT NULL,
-                    description TEXT NOT NULL,
-                    severity TEXT NOT NULL,
-                    quantity REAL NOT NULL DEFAULT 0,
-                    threshold REAL NOT NULL DEFAULT 1,
-                    status TEXT NOT NULL CHECK(status IN ({statuses})),
-                    version INTEGER NOT NULL DEFAULT 1,
-                    external_ref TEXT,
-                    created_by TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-                CREATE UNIQUE INDEX IF NOT EXISTS ux_items_external_ref
-                    ON items(external_ref) WHERE external_ref IS NOT NULL;
-                CREATE TABLE IF NOT EXISTS records (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
-                    kind TEXT NOT NULL,
-                    detail TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'open'
-                        CHECK(status IN ('open','closed')),
-                    external_ref TEXT,
-                    created_by TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    UNIQUE(item_id, external_ref)
-                );
-                CREATE TABLE IF NOT EXISTS audit_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    action TEXT NOT NULL,
-                    entity_type TEXT NOT NULL,
-                    entity_id INTEGER NOT NULL,
-                    actor TEXT NOT NULL,
-                    detail TEXT NOT NULL,
-                    previous_hash TEXT NOT NULL,
-                    entry_hash TEXT NOT NULL UNIQUE,
-                    created_at TEXT NOT NULL
-                );
-            """)
+            if version < 1:
+                self._migrate_base()
+            if version < 2:
+                self._migrate_notices()
+            self.conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+
+    def _migrate_base(self) -> None:
+        statuses = ",".join("'" + s.replace("'", "''") + "'" for s in STATES)
+        self.conn.executescript(f"""
+            CREATE TABLE IF NOT EXISTS items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                quantity REAL NOT NULL DEFAULT 0,
+                threshold REAL NOT NULL DEFAULT 1,
+                status TEXT NOT NULL CHECK(status IN ({statuses})),
+                version INTEGER NOT NULL DEFAULT 1,
+                external_ref TEXT,
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_items_external_ref
+                ON items(external_ref) WHERE external_ref IS NOT NULL;
+            CREATE TABLE IF NOT EXISTS records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                kind TEXT NOT NULL,
+                detail TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'open'
+                    CHECK(status IN ('open','closed')),
+                external_ref TEXT,
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(item_id, external_ref)
+            );
+            CREATE TABLE IF NOT EXISTS audit_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                action TEXT NOT NULL,
+                entity_type TEXT NOT NULL,
+                entity_id INTEGER NOT NULL,
+                actor TEXT NOT NULL,
+                detail TEXT NOT NULL,
+                previous_hash TEXT NOT NULL,
+                entry_hash TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL
+            );
+        """)
+
+    def _migrate_notices(self) -> None:
+        measures = ",".join("'" + m + "'" for m in NOTICE_MEASURES)
+        self.conn.executescript(f"""
+            CREATE TABLE IF NOT EXISTS notices (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                notice_no TEXT NOT NULL UNIQUE,
+                issuer TEXT NOT NULL,
+                measure TEXT NOT NULL CHECK(measure IN ({measures})),
+                effective_from TEXT NOT NULL,
+                effective_to TEXT NOT NULL,
+                lifted_at TEXT,
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS ix_notices_measure ON notices(measure, id);
+        """)
 
     @staticmethod
     def _item(row: sqlite3.Row) -> Dict[str, Any]:
@@ -156,6 +183,65 @@ class Repository:
                 (item_id,),
             ).fetchone()
         return int(row["n"])
+
+    def create_notice(self, notice_no: str, issuer: str, measure: str,
+                      effective_from: str, effective_to: str,
+                      actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        try:
+            with self._lock, self.conn:
+                cur = self.conn.execute(
+                    """INSERT INTO notices(notice_no, issuer, measure, effective_from,
+                       effective_to, lifted_at, created_by, created_at)
+                       VALUES(?,?,?,?,?,NULL,?,?)""",
+                    (notice_no, issuer, measure, effective_from, effective_to, actor, now),
+                )
+                notice_id = int(cur.lastrowid)
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("通告编号已存在") from exc
+        return self.get_notice(notice_id)
+
+    def get_notice(self, notice_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM notices WHERE id=?", (notice_id,)).fetchone()
+        if row is None:
+            raise NotFoundError("通告不存在")
+        return dict(row)
+
+    def latest_notice(self, measure: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM notices WHERE measure=? ORDER BY id DESC LIMIT 1",
+                (measure,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_notices(self, measure: Optional[str] = None) -> List[Dict[str, Any]]:
+        sql = "SELECT * FROM notices"
+        params: tuple = ()
+        if measure:
+            sql += " WHERE measure=?"
+            params = (measure,)
+        sql += " ORDER BY id DESC"
+        with self._lock:
+            rows = self.conn.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def lift_notice(self, notice_id: int, actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                "UPDATE notices SET lifted_at=? WHERE id=? AND lifted_at IS NULL",
+                (now, notice_id),
+            )
+            if cur.rowcount == 0:
+                exists = self.conn.execute(
+                    "SELECT 1 FROM notices WHERE id=?", (notice_id,)).fetchone()
+                if exists is None:
+                    raise NotFoundError("通告不存在")
+                raise ConflictError("通告已解除")
+        return self.get_notice(notice_id)
 
     def append_audit(self, action: str, entity_type: str, entity_id: int,
                      actor: str, detail: dict) -> Dict[str, Any]:

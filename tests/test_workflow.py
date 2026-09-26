@@ -3,6 +3,7 @@ from pathlib import Path
 from src.repository import Repository
 from src.service import Service
 from src.rules import STATES, TRANSITION_ROLES
+NOTICE_WINDOW={"effective_from":"2020-01-01T00:00:00+00:00","effective_to":"2099-01-01T00:00:00+00:00"}
 class WorkflowTest(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory(); self.repo=Repository(str(Path(self.tmp.name)/"test.db")); self.service=Service(self.repo)
@@ -11,6 +12,8 @@ class WorkflowTest(unittest.TestCase):
         item=self.service.create_item({"title":"workflow item","description":"complete business flow","severity":'warning',"quantity":12,"threshold":6,"external_ref":"WF-1"},"creator",'sensor_operator')
         self.assertEqual(item["status"],STATES[0])
         self.service.add_record(item["id"],{"kind":"evidence","detail":"evidence registered","status":"closed","external_ref":"EV-1"},"recorder",'sensor_operator')
+        for index,measure in enumerate(["restriction","closure","recovery"]):
+            self.service.create_notice({"notice_no":f"WF-N{index}","issuer":"交通管理局","measure":measure,**NOTICE_WINDOW},"clerk",'traffic_authority')
         current=item
         for target in STATES[1:]:
             current=self.service.transition(current["id"],target,current["version"],"reviewer",TRANSITION_ROLES[target][0])

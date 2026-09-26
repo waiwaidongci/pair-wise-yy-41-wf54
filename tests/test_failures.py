@@ -4,6 +4,7 @@ from src.domain import ConflictError, PermissionDenied
 from src.repository import Repository
 from src.service import Service
 from src.rules import STATES, TRANSITION_ROLES
+NOTICE_WINDOW={"effective_from":"2020-01-01T00:00:00+00:00","effective_to":"2099-01-01T00:00:00+00:00"}
 class FailureTest(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory(); self.repo=Repository(str(Path(self.tmp.name)/"test.db")); self.service=Service(self.repo)
@@ -15,6 +16,8 @@ class FailureTest(unittest.TestCase):
         payload={"kind":"action","detail":"same reference","status":"open","external_ref":"DUP-1"}
         self.service.add_record(self.item["id"],payload,"recorder",'sensor_operator')
         with self.assertRaises(ConflictError): self.service.add_record(self.item["id"],payload,"recorder",'sensor_operator')
+        for index,measure in enumerate(["restriction","closure","recovery"]):
+            self.service.create_notice({"notice_no":f"FAIL-N{index}","issuer":"交通管理局","measure":measure,**NOTICE_WINDOW},"clerk",'traffic_authority')
         current=self.service.get_item(self.item["id"],"viewer")
         for target in STATES[1:-1]: current=self.service.transition(current["id"],target,current["version"],"reviewer",TRANSITION_ROLES[target][0])
         with self.assertRaises(ConflictError): self.service.transition(current["id"],STATES[-1],current["version"],"reviewer",TRANSITION_ROLES[STATES[-1]][0])
